@@ -8,7 +8,9 @@ services:
       rm -rf .venv
       pip install --upgrade pip
       pip install -r requirements_web.txt
+      export PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.playwright-browsers
       playwright install chromium --with-deps
+      ls -l /opt/render/project/src/.playwright-browsers/chromium-*/chrome-linux/
 
     startCommand: python whatsapp_web_bot_fixed.py
     envVars:
