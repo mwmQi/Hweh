@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 WhatsApp Web Bot with Web Interface
@@ -20,12 +21,12 @@ import qrcode
 from PIL import Image
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
+
+from playwright.sync_api import sync_playwright
+
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session as flask_session
 from flask_cors import CORS
 import secrets
-
-# Import Green-API client
-from green_api import GreenApi
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,12 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 ADMIN_PHONE = os.getenv('ADMIN_PHONE', '+1234567890')
-SESSION_STRING = os.getenv('SESSION_STRING', '') # Not directly used by Green-API, but kept for consistency
 SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_hex(32))
-
-# Green-API credentials (from environment variables)
-GREEN_API_INSTANCE_ID = os.getenv('GREEN_API_INSTANCE_ID')
-GREEN_API_TOKEN = os.getenv('GREEN_API_TOKEN')
 
 # API Configuration (if still needed for other features)
 FLUX_API_URL = "https://text2img.hideme.eu.org/image"
@@ -90,124 +86,179 @@ def set_config(key, value):
         logger.error(f"Error setting config {key}: {e}")
 
 class WhatsAppBot:
-    def __init__(self, instance_id, api_token):
-        self.green_api = GreenApi(instance_id, api_token)
+    def __init__(self, session_data=None, headless=True):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.session_data = session_data
+        self.headless = headless
         self.is_running = False
         self.current_qr_base64 = None
 
+    def start_playwright(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=self.headless)
+        self.context = self.browser.new_context()
+        self.page = self.context.new_page()
+
+    def stop_playwright(self):
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+
+    def load_session(self):
+        if self.session_data:
+            # Load cookies
+            if 'cookies' in self.session_data:
+                self.context.add_cookies(self.session_data['cookies'])
+            
+            # Load local storage (Playwright doesn't have direct API for all local storage, need to execute JS)
+            self.page.goto("https://web.whatsapp.com") # Navigate to the page first
+            if 'local_storage' in self.session_data:
+                for key, value in self.session_data['local_storage'].items():
+                    self.page.evaluate(f"localStorage.setItem('{key}', '{value}');")
+            
+            # Load session storage (similar to local storage)
+            if 'session_storage' in self.session_data:
+                for key, value in self.session_data['session_storage'].items():
+                    self.page.evaluate(f"sessionStorage.setItem('{key}', '{value}');")
+            
+            self.page.goto("https://web.whatsapp.com") # Refresh to apply storage
+            logger.info("Session data loaded.")
+            return True
+        return False
+
     def get_qr_code(self):
         try:
-            response = self.green_api.account.getQr()
-            if response.code == 200 and response.data.qrCode:
-                self.current_qr_base64 = response.data.qrCode
-                session_status["qr_generated"] = True
-                session_status["waiting_for_scan"] = True
-                return response.data.qrCode
-            else:
-                logger.error(f"Green-API getQr failed: {response.error}")
-                return None
+            self.start_playwright()
+            self.page.goto("https://web.whatsapp.com")
+            self.page.wait_for_selector("[data-ref] canvas", timeout=30000)
+            qr_code_element = self.page.query_selector("[data-ref] canvas")
+            qr_code_base64 = self.page.evaluate("canvas => canvas.toDataURL('image/png').substring(22);", qr_code_element)
+            self.current_qr_base64 = qr_code_base64
+            session_status["qr_generated"] = True
+            session_status["waiting_for_scan"] = True
+            return qr_code_base64
         except Exception as e:
-            logger.error(f"Error getting QR code from Green-API: {e}")
+            logger.error(f"Error getting QR code: {e}")
             return None
 
     def wait_for_login_and_extract_session(self):
-        # For Green-API, session is managed by their service. We just check status.
         try:
-            # Poll status until authorized
-            max_attempts = 60 # Check for 5 minutes (60 * 5 seconds)
-            for _ in range(max_attempts):
-                response = self.green_api.account.getStateInstance()
-                if response.code == 200 and response.data.stateInstance == 'authorized':
-                    session_status["logged_in"] = True
-                    session_status["session_valid"] = True
-                    session_status["last_check"] = time.time()
-                    session_status["waiting_for_scan"] = False
-                    logger.info("Green-API instance authorized successfully!")
-                    return True
-                elif response.code == 200 and response.data.stateInstance == 'notAuthorized':
-                    logger.info("Green-API instance not yet authorized. Waiting...")
-                else:
-                    logger.error(f"Green-API getStateInstance failed: {response.error}")
-                time.sleep(5)
-            logger.error("Timeout waiting for Green-API instance to be authorized.")
+            self.page.wait_for_selector("#side", timeout=300000) # Wait for main chat list
+            logger.info("Login successful! Extracting session data...")
+            
+            # Extract cookies
+            cookies = self.context.cookies()
+            
+            # Extract local storage
+            local_storage = self.page.evaluate("""
+                var ls = {};
+                for (var i = 0; i < localStorage.length; i++) {
+                    var key = localStorage.key(i);
+                    ls[key] = localStorage.getItem(key);
+                }
+                return ls;
+            """)
+            
+            # Extract session storage
+            session_storage = self.page.evaluate("""
+                var ss = {};
+                for (var i = 0; i < sessionStorage.length; i++) {
+                    var key = sessionStorage.key(i);
+                    ss[key] = sessionStorage.getItem(key);
+                }
+                return ss;
+            """)
+            
+            session_data = {
+                'cookies': cookies,
+                'local_storage': local_storage,
+                'session_storage': session_storage,
+            }
+            
+            session_json = json.dumps(session_data, default=str)
+            set_config('session_string', session_json) # Save as JSON string
+            
+            session_status["logged_in"] = True
+            session_status["session_valid"] = True
+            session_status["last_check"] = time.time()
             session_status["waiting_for_scan"] = False
-            return False
+            logger.info("Session extracted and saved successfully!")
+            return True
         except Exception as e:
-            logger.error(f"Error waiting for Green-API login: {e}")
+            logger.error(f"Error during login and session extraction: {e}")
             session_status["waiting_for_scan"] = False
             return False
 
     def get_phone_link_code(self, phone_number):
         try:
-            response = self.green_api.account.getLink(phoneNumber=phone_number)
-            if response.code == 200 and response.data.linkCode:
-                session_status["qr_generated"] = False # Not a QR, but a link code
-                session_status["waiting_for_scan"] = True
-                return {"success": True, "code": response.data.linkCode}
-            else:
-                logger.error(f"Green-API getLink failed: {response.error}")
-                return {"success": False, "error": response.error, "screenshot": None}
+            self.start_playwright()
+            self.page.goto("https://web.whatsapp.com")
+            self.page.wait_for_selector("//span[@role='button' and contains(text(), 'Link with phone number')]").click()
+            self.page.wait_for_selector("input[aria-label='Phone number']").fill(phone_number)
+            self.page.wait_for_selector("//div[@role='button' and contains(text(), 'Next')]").click()
+            
+            code_elements = self.page.wait_for_selector("div[data-testid='link-code']")
+            code = code_elements.text_content().replace(" ", "") # Remove spaces
+            
+            session_status["qr_generated"] = False # Not a QR, but a link code
+            session_status["waiting_for_scan"] = True
+            return {"success": True, "code": code}
         except Exception as e:
-            logger.error(f"Error getting phone link code from Green-API: {e}")
-            return {"success": False, "error": str(e), "screenshot": None}
+            logger.error(f"Error getting phone link code: {e}")
+            screenshot_b64 = self.page.screenshot(encoding='base64') if self.page else None
+            return {"success": False, "error": str(e), "screenshot": screenshot_b64}
 
     def start(self):
-        # For Green-API, starting means ensuring the instance is authorized
         try:
-            response = self.green_api.account.getStateInstance()
-            if response.code == 200 and response.data.stateInstance == 'authorized':
-                self.is_running = True
-                session_status["logged_in"] = True
-                session_status["session_valid"] = True
-                session_status["last_check"] = time.time()
-                logger.info("Green-API instance is authorized and bot is running.")
-                return True
-            else:
-                logger.warning(f"Green-API instance not authorized: {response.data.stateInstance}. Cannot start bot.")
-                session_status["logged_in"] = False
-                session_status["session_valid"] = False
-                return False
+            self.start_playwright()
+            saved_session = get_config('session_string')
+            if saved_session:
+                self.session_data = json.loads(saved_session)
+                if self.load_session():
+                    self.page.goto("https://web.whatsapp.com")
+                    self.page.wait_for_selector("#side", timeout=60000) # Wait for main chat list
+                    self.is_running = True
+                    session_status["logged_in"] = True
+                    session_status["session_valid"] = True
+                    session_status["last_check"] = time.time()
+                    logger.info("Bot started and session restored successfully!")
+                    return True
+            logger.warning("No valid session found or failed to restore. Please generate a new session.")
+            return False
         except Exception as e:
-            logger.error(f"Error starting bot with Green-API: {e}")
+            logger.error(f"Error starting bot: {e}")
             return False
 
     def stop(self):
-        # For Green-API, stopping means logging out the instance
-        try:
-            response = self.green_api.account.logout()
-            if response.code == 200:
-                self.is_running = False
-                session_status["logged_in"] = False
-                session_status["session_valid"] = False
-                logger.info("Green-API instance logged out.")
-                return True
-            else:
-                logger.error(f"Green-API logout failed: {response.error}")
-                return False
-        except Exception as e:
-            logger.error(f"Error stopping bot with Green-API: {e}")
-            return False
+        self.is_running = False
+        self.stop_playwright()
+        session_status["logged_in"] = False
+        session_status["session_valid"] = False
+        logger.info("WhatsApp bot stopped")
 
-    # Placeholder for sending messages (to be implemented with Green-API)
+    # Placeholder for sending messages (to be implemented with Playwright)
     def send_message(self, chat_id, message):
         try:
-            response = self.green_api.sending.sendMessage(chatId=chat_id, message=message)
-            if response.code == 200:
-                logger.info(f"Message sent to {chat_id}: {message}")
-                return True
-            else:
-                logger.error(f"Failed to send message to {chat_id}: {response.error}")
-                return False
+            # Example: Find chat, type message, send
+            # This is a simplified example and needs proper selectors and error handling
+            self.page.wait_for_selector(f"span[title='{chat_id}']").click()
+            self.page.wait_for_selector("div[data-testid='compose-box']").fill(message)
+            self.page.press("div[data-testid='compose-box']", "Enter")
+            logger.info(f"Message sent to {chat_id}: {message}")
+            return True
         except Exception as e:
-            logger.error(f"Error sending message: {e}")
+            logger.error(f"Error sending message to {chat_id}: {e}")
             return False
 
-    # Placeholder for receiving messages (to be implemented with Green-API webhooks)
+    # Placeholder for receiving messages (requires continuous polling or webhooks)
     def start_message_listener(self):
-        logger.info("Green-API message listener would typically be handled via webhooks.")
-        logger.info("Please configure webhooks in your Green-API account for incoming messages.")
-        # For a full implementation, you would set up a webhook endpoint in Flask
-        # and process incoming messages from Green-API there.
+        logger.info("Message listener started (Playwright). This would involve polling or more advanced techniques.")
+        # For a full implementation, you would continuously check for new messages
+        # by observing the DOM or using WhatsApp Web's internal APIs if possible.
 
 # Flask Web Application
 app = Flask(__name__)
@@ -268,6 +319,13 @@ MAIN_TEMPLATE = """
                     <div style="color: red; margin-bottom: 10px;">❌ No active session. Please connect.</div>
                     <a href="/generate-session" class="btn">Generate via QR Code</a>
                     <a href="/link-with-phone" class="btn">Link with Phone Number</a>
+                    <form method="POST" action="/load-session-json" style="margin-top: 20px;">
+                        <div class="form-group">
+                            <label for="session_json">Load Session from JSON:</label>
+                            <textarea name="session_json" id="session_json" rows="8" placeholder="Paste your session JSON here..."></textarea>
+                        </div>
+                        <button type="submit" class="btn">Load Session</button>
+                    </form>
                 {% endif %}
             </div>
             <div class="card">
@@ -423,7 +481,12 @@ DEBUG_TEMPLATE = """
     <div class="container">
         <h1>🤖 Oops! The Bot Got Stuck.</h1>
         <p><b>Error:</b> {{ error }}</p>
-        <p><b>Note:</b> Screenshots are not available with the Green-API. The error above is from the Green-API client.</p>
+        {% if screenshot_b64 %}
+            <h2>Here's what the bot was seeing:</h2>
+            <img src="data:image/png;base64,{{ screenshot_b64 }}" alt="Bot Screenshot">
+        {% else %}
+            <p>No screenshot available.</p>
+        {% endif %}
         <div><a href="/" class="btn">← Back to Dashboard</a></div>
     </div>
 </body>
@@ -432,22 +495,11 @@ DEBUG_TEMPLATE = """
 
 @app.route('/')
 def dashboard():
-    # For Green-API, we check the instance state directly
+    # Check session status for Playwright
     global bot_instance
-    if GREEN_API_INSTANCE_ID and GREEN_API_TOKEN:
-        bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-        try:
-            response = bot_instance.green_api.account.getStateInstance()
-            if response.code == 200 and response.data.stateInstance == 'authorized':
-                session_status["logged_in"] = True
-                session_status["session_valid"] = True
-            else:
-                session_status["logged_in"] = False
-                session_status["session_valid"] = False
-        except Exception as e:
-            logger.error(f"Error checking Green-API instance state: {e}")
-            session_status["logged_in"] = False
-            session_status["session_valid"] = False
+    if bot_instance and bot_instance.is_running:
+        session_status["logged_in"] = True
+        session_status["session_valid"] = True
     else:
         session_status["logged_in"] = False
         session_status["session_valid"] = False
@@ -457,16 +509,18 @@ def dashboard():
 @app.route('/generate-session')
 def generate_session():
     global bot_instance
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        return render_template_string(DEBUG_TEMPLATE, error="Green-API credentials not set in environment variables.")
-
-    bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-    qr_code = bot_instance.get_qr_code()
-    if qr_code:
-        threading.Thread(target=bot_instance.wait_for_login_and_extract_session, daemon=True).start()
-        return render_template_string(QR_TEMPLATE, qr_code=qr_code)
-    else:
-        return render_template_string(DEBUG_TEMPLATE, error="Failed to get QR code from Green-API.")
+    bot_instance = WhatsAppBot(headless=True)
+    try:
+        bot_instance.start_playwright()
+        qr_code = bot_instance.get_qr_code()
+        if qr_code:
+            threading.Thread(target=bot_instance.wait_for_login_and_extract_session, daemon=True).start()
+            return render_template_string(QR_TEMPLATE, qr_code=qr_code)
+        else:
+            return render_template_string(DEBUG_TEMPLATE, error="Failed to get QR code.", screenshot_b64=None)
+    except Exception as e:
+        logger.error(f"Error in generate_session: {e}")
+        return render_template_string(DEBUG_TEMPLATE, error=str(e), screenshot_b64=None)
 
 @app.route('/check-session-status')
 def check_session_status():
@@ -475,95 +529,105 @@ def check_session_status():
 @app.route('/link-with-phone', methods=['GET', 'POST'])
 def link_with_phone():
     global bot_instance
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        return render_template_string(DEBUG_TEMPLATE, error="Green-API credentials not set in environment variables.")
-
     if request.method == 'POST':
         phone_number = request.form.get('phone_number')
-        bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-        result = bot_instance.get_phone_link_code(phone_number)
-        if result["success"]:
-            threading.Thread(target=bot_instance.wait_for_login_and_extract_session, daemon=True).start()
-            return render_template_string(SHOW_CODE_TEMPLATE, code=result["code"])
-        else:
-            return render_template_string(DEBUG_TEMPLATE, error=result["error"], screenshot_b64=result["screenshot"])
+        bot_instance = WhatsAppBot(headless=True)
+        try:
+            bot_instance.start_playwright()
+            result = bot_instance.get_phone_link_code(phone_number)
+            if result["success"]:
+                threading.Thread(target=bot_instance.wait_for_login_and_extract_session, daemon=True).start()
+                return render_template_string(SHOW_CODE_TEMPLATE, code=result["code"])
+            else:
+                return render_template_string(DEBUG_TEMPLATE, error=result["error"], screenshot_b64=result["screenshot"])
+        except Exception as e:
+            logger.error(f"Error in link_with_phone: {e}")
+            return render_template_string(DEBUG_TEMPLATE, error=str(e), screenshot_b64=None)
     return render_template_string(PHONE_LINK_TEMPLATE)
+
+@app.route('/load-session-json', methods=['POST'])
+def load_session_json():
+    global bot_instance
+    session_json_str = request.form.get('session_json')
+    if not session_json_str:
+        flask_session['message'] = "No session JSON provided."
+        flask_session['message_type'] = "error"
+        return redirect(url_for('dashboard'))
+
+    try:
+        session_data = json.loads(session_json_str)
+        bot_instance = WhatsAppBot(session_data=session_data, headless=True)
+        if bot_instance.start():
+            flask_session['message'] = "Session loaded and bot started successfully!"
+            flask_session['message_type'] = "success"
+        else:
+            flask_session['message'] = "Failed to load session or start bot."
+            flask_session['message_type'] = "error"
+    except json.JSONDecodeError:
+        flask_session['message'] = "Invalid JSON format."
+        flask_session['message_type'] = "error"
+    except Exception as e:
+        logger.error(f"Error loading session JSON: {e}")
+        flask_session['message'] = f"Error loading session: {str(e)}"
+        flask_session['message_type'] = "error"
+    
+    return redirect(url_for('dashboard'))
 
 @app.route('/start-bot')
 def start_bot_route():
     global bot_instance
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        flask_session['message'] = "Green-API credentials not set. Cannot start bot."
-        flask_session['message_type'] = "error"
+    if bot_instance and bot_instance.is_running:
+        flask_session['message'] = "Bot is already running."
+        flask_session['message_type'] = "info"
         return redirect(url_for('dashboard'))
 
-    bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
+    bot_instance = WhatsAppBot(headless=True)
     if bot_instance.start():
         flask_session['message'] = "Bot started successfully!"
         flask_session['message_type'] = "success"
     else:
-        flask_session['message'] = "Failed to start bot. Check Green-API instance status."
+        flask_session['message'] = "Failed to start bot. Please generate or load a valid session."
         flask_session['message_type'] = "error"
     return redirect(url_for('dashboard'))
 
 @app.route('/stop-bot')
 def stop_bot_route():
     global bot_instance
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        flask_session['message'] = "Green-API credentials not set. Cannot stop bot."
-        flask_session['message_type'] = "error"
-        return redirect(url_for('dashboard'))
-
-    bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-    if bot_instance.stop():
+    if bot_instance:
+        bot_instance.stop()
         flask_session['message'] = "Bot stopped successfully!"
         flask_session['message_type'] = "success"
     else:
-        flask_session['message'] = "Failed to stop bot."
-        flask_session['message_type'] = "error"
+        flask_session['message'] = "Bot is not running."
+        flask_session['message_type'] = "info"
     return redirect(url_for('dashboard'))
 
 @app.route('/regenerate-session')
 def regenerate_session():
-    # For Green-API, this means logging out the current session
     global bot_instance
-    if GREEN_API_INSTANCE_ID and GREEN_API_TOKEN:
-        bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-        bot_instance.stop() # This logs out the instance
-    
+    if bot_instance:
+        bot_instance.stop()
+    set_config('session_string', '') # Clear saved session
     session_status["logged_in"] = False
     session_status["session_valid"] = False
     session_status["qr_generated"] = False
     session_status["waiting_for_scan"] = False
-    flask_session['message'] = "Session logged out. Please generate a new one."
+    flask_session['message'] = "Session cleared. Please generate a new one."
     flask_session['message_type'] = "info"
     return redirect(url_for('dashboard'))
 
 @app.route('/restart-bot')
 def restart_bot_route():
     global bot_instance
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        flask_session['message'] = "Green-API credentials not set. Cannot restart bot."
-        flask_session['message_type'] = "error"
-        return redirect(url_for('dashboard'))
-
-    bot_instance = WhatsAppBot(GREEN_API_INSTANCE_ID, GREEN_API_TOKEN)
-    bot_instance.stop()
-    time.sleep(2) # Give some time for the instance to log out
-    if bot_instance.start():
-        flask_session['message'] = "Bot restarted successfully!"
-        flask_session['message_type'] = "success"
-    else:
-        flask_session['message'] = "Failed to restart bot. Check Green-API instance status."
-        flask_session['message_type'] = "error"
+    if bot_instance:
+        bot_instance.stop()
+    time.sleep(2) # Give some time for the browser to close
+    start_bot_route()
     return redirect(url_for('dashboard'))
 
 def main():
-    print("Starting WhatsApp Web Bot with Web Interface (Green-API version)...")
+    print("Starting WhatsApp Web Bot with Web Interface (Playwright version)...")
     print("=" * 50)
-    if not GREEN_API_INSTANCE_ID or not GREEN_API_TOKEN:
-        print("WARNING: GREEN_API_INSTANCE_ID or GREEN_API_TOKEN not set.")
-        print("Please set these environment variables for the bot to function.")
     print("🌐 Web Interface: http://localhost:8000")
     print("=" * 50)
     port = int(os.getenv("PORT", 8000))
