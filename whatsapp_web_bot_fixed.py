@@ -547,9 +547,11 @@ def link_with_phone():
 
 @app.route('/load-session-json', methods=['POST'])
 def load_session_json():
+    logger.info("Received request to /load-session-json")
     global bot_instance
     session_json_str = request.form.get('session_json')
     if not session_json_str:
+        logger.warning("No session JSON provided.")
         flask_session['message'] = "No session JSON provided."
         flask_session['message_type'] = "error"
         return redirect(url_for('dashboard'))
@@ -557,37 +559,67 @@ def load_session_json():
     try:
         session_data = json.loads(session_json_str)
         bot_instance = WhatsAppBot(session_data=session_data, headless=True)
-        if bot_instance.start():
+        bot_instance.start_playwright() # Start Playwright here
+        if bot_instance.load_session():
+            # After loading session, try to navigate to WhatsApp Web and check login status
+            bot_instance.page.goto("https://web.whatsapp.com")
+            bot_instance.page.wait_for_selector("#side", timeout=60000) # Wait for main chat list
+            bot_instance.is_running = True
+            session_status["logged_in"] = True
+            session_status["session_valid"] = True
+            session_status["last_check"] = time.time()
+            logger.info("Session loaded and bot started successfully!")
             flask_session['message'] = "Session loaded and bot started successfully!"
             flask_session['message_type'] = "success"
         else:
+            logger.error("Failed to load session or start bot.")
             flask_session['message'] = "Failed to load session or start bot."
             flask_session['message_type'] = "error"
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON format: {e}")
         flask_session['message'] = "Invalid JSON format."
         flask_session['message_type'] = "error"
     except Exception as e:
         logger.error(f"Error loading session JSON: {e}")
         flask_session['message'] = f"Error loading session: {str(e)}"
         flask_session['message_type'] = "error"
+    finally:
+        # Ensure playwright is stopped if an error occurs during session loading
+        if bot_instance and not bot_instance.is_running:
+            bot_instance.stop_playwright()
     
     return redirect(url_for('dashboard'))
 
 @app.route('/start-bot')
 def start_bot_route():
+    logger.info("Received request to /start-bot")
     global bot_instance
     if bot_instance and bot_instance.is_running:
+        logger.info("Bot is already running.")
         flask_session['message'] = "Bot is already running."
         flask_session['message_type'] = "info"
         return redirect(url_for('dashboard'))
 
     bot_instance = WhatsAppBot(headless=True)
-    if bot_instance.start():
-        flask_session['message'] = "Bot started successfully!"
-        flask_session['message_type'] = "success"
-    else:
-        flask_session['message'] = "Failed to start bot. Please generate or load a valid session."
+    try:
+        bot_instance.start_playwright() # Start Playwright here
+        if bot_instance.start():
+            logger.info("Bot started successfully!")
+            flask_session['message'] = "Bot started successfully!"
+            flask_session['message_type'] = "success"
+        else:
+            logger.error("Failed to start bot. Please generate or load a valid session.")
+            flask_session['message'] = "Failed to start bot. Please generate or load a valid session."
+            flask_session['message_type'] = "error"
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        flask_session['message'] = f"Error starting bot: {str(e)}"
         flask_session['message_type'] = "error"
+    finally:
+        # Ensure playwright is stopped if an error occurs during bot start
+        if bot_instance and not bot_instance.is_running:
+            bot_instance.stop_playwright()
+    
     return redirect(url_for('dashboard'))
 
 @app.route('/stop-bot')
