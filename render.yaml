@@ -4,31 +4,11 @@ services:
     env: python
     plan: free
     buildCommand: |
-      # Install system dependencies for Pillow and Chrome
-      apt-get update && apt-get install -y libjpeg-dev zlib1g-dev wget gnupg unzip
-      
-      # Install Google Chrome
-      wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
-      echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
-      apt-get update
-      apt-get install -y google-chrome-stable
-      
-      # Install ChromeDriver
-      CHROME_DRIVER_VERSION=$(curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE)
-      wget -N http://chromedriver.storage.googleapis.com/$CHROME_DRIVER_VERSION/chromedriver_linux64.zip -P /tmp/
-      unzip /tmp/chromedriver_linux64.zip -d /tmp/
-      rm /tmp/chromedriver_linux64.zip
-      mv /tmp/chromedriver /usr/local/bin/chromedriver
-      chmod +x /usr/local/bin/chromedriver
-      
-      # Install Python packages
+      apt-get update && apt-get install -y libjpeg-dev zlib1g-dev libnss3 libfontconfig1 libdbus-1-3 libgtk-3-0 libxss1 libasound2 libatk-bridge2.0-0 libgconf-2-4 libgbm1 libdrm-dev
       pip install -r requirements_web.txt
+      playwright install chromium
 
-    startCommand: python whatsapp_web_bot_with_ui.py
+    startCommand: python whatsapp_web_bot_fixed.py
     envVars:
-      - key: GOOGLE_CHROME_BIN
-        value: "/usr/bin/google-chrome"
-      - key: CHROMEDRIVER_PATH
-        value: "/usr/bin/chromedriver"
       - key: SECRET_KEY
         generateValue: true
