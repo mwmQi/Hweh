@@ -13,6 +13,14 @@ services:
       apt-get update
       apt-get install -y google-chrome-stable
       
+      # Install ChromeDriver
+      CHROME_DRIVER_VERSION=$(curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE)
+      wget -N http://chromedriver.storage.googleapis.com/$CHROME_DRIVER_VERSION/chromedriver_linux64.zip -P /tmp/
+      unzip /tmp/chromedriver_linux64.zip -d /tmp/
+      rm /tmp/chromedriver_linux64.zip
+      mv /tmp/chromedriver /usr/local/bin/chromedriver
+      chmod +x /usr/local/bin/chromedriver
+      
       # Install Python packages
       pip install -r requirements_web.txt
 
