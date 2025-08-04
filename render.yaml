@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: whatsapp-web-bot-ui
+    env: python
+    plan: free
+    buildCommand: |
+      # Install system dependencies for Pillow and Chrome
+      apt-get update
+      apt-get install -y libjpeg-dev zlib1g-dev wget gnupg unzip
+      # Install Python packages
+      pip install -r requirements_web.txt
+      # Install Chrome and ChromeDriver for Render
+      wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+      echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
+      apt-get update
+      apt-get install -y google-chrome-stable
+      # Install ChromeDriver
+      CHROME_DRIVER_VERSION=`curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE`
+      wget -N http://chromedriver.storage.googleapis.com/$CHROME_DRIVER_VERSION/chromedriver_linux64.zip -P ~/
+      unzip ~/chromedriver_linux64.zip -d ~/
+      rm ~/chromedriver_linux64.zip
+      mv ~/chromedriver /usr/local/bin/chromedriver
+      chmod +x /usr/local/bin/chromedriver
+    startCommand: python whatsapp_web_bot_with_ui.py
+    envVars:
+      - key: ADMIN_PHONE
+        value: "+1234567890"
+      - key: SESSION_STRING
+        value: ""
+      - key: PORT
+        value: "10000"
+      - key: GOOGLE_CHROME_BIN
+        value: "/usr/bin/google-chrome"
+      - key: CHROMEDRIVER_PATH
+        value: "/usr/local/bin/chromedriver"
+      - key: SECRET_KEY
+        generateValue: true
+
